@@ -614,6 +614,7 @@ class TestStartServerFallback(unittest.TestCase):
         client.get_me.return_value = {"login": "testuser"}
         client.get_servers.return_value = [expired_srv]
         client.start_server.return_value = (True, 200, "Server started")
+        client.stop_server.return_value = (True, 200, "Server stopped")
         client_cls.return_value = client
 
         state = {}
@@ -625,6 +626,95 @@ class TestStartServerFallback(unittest.TestCase):
         self.assertGreaterEqual(sleep.call_count, 1)
         self.assertNotEqual(state["srv-stale"]["status"], "success")
         notify.assert_called_once()
+
+    @patch("app.time.sleep")
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha")
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_stop_wait_start_recovers_running_expired_deadlock(
+        self, client_cls, obtain, browser, notify, sleep
+    ):
+        """母机失联把到期机器卡在 running：CAPTCHA 400 后主动 /stop，等翻 stopped 再 start 续期。"""
+        now = int(time.time() * 1000)
+        expired_srv = {
+            "id": "srv-deadlock",
+            "name": "Deadlocked VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now - 1000,
+        }
+        renewed_srv = dict(expired_srv, status="running", expiresAt=now + 48 * app.ONE_HOUR_MS)
+
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        stop_requested = {"n": 0}
+
+        def fake_get_servers():
+            # 真实语义：stop 请求受理后，下一次状态查询已翻回 running 且续期生效
+            if stop_requested["n"] > 0:
+                return [renewed_srv]
+            return [expired_srv]
+
+        def fake_stop(server_id):
+            stop_requested["n"] += 1
+            return (True, 200, "Server stopped")
+
+        client.get_servers.side_effect = fake_get_servers
+        client.start_server.return_value = (True, 200, "Server started")
+        client.stop_server.side_effect = fake_stop
+        client_cls.return_value = client
+        browser.return_value = (
+            (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+            "",
+        )
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+
+        self.assertTrue(ok)
+        client.stop_server.assert_called_once_with("srv-deadlock")
+        self.assertEqual(state["srv-deadlock"]["status"], "success")
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.kwargs["status_title"], "Vyce VPS 续期成功")
+
+    @patch("app.time.sleep")
+    @patch("app.send_notification")
+    @patch("app.renew_with_captcha")
+    @patch("app.obtain_captcha_token")
+    @patch("app.VyceClient")
+    def test_stop_wait_start_gives_up_when_status_never_flips(
+        self, client_cls, obtain, browser, notify, sleep
+    ):
+        """stop 请求后机器始终不翻 stopped：绝不假报成功，如实失败并告警。"""
+        now = int(time.time() * 1000)
+        expired_srv = {
+            "id": "srv-stuck",
+            "name": "Stuck VPS",
+            "source": "free",
+            "status": "running",
+            "expiresAt": now - 1000,
+        }
+
+        client = MagicMock()
+        client.get_me.return_value = {"login": "testuser"}
+        client.get_servers.return_value = [expired_srv]
+        client.start_server.return_value = (True, 200, "Server started")
+        client.stop_server.return_value = (True, 200, "Server stopped")
+        client_cls.return_value = client
+        browser.return_value = (
+            (False, 400, '{"error":"invalid_captcha","message":"CAPTCHA verification failed. Please try again."}'),
+            "",
+        )
+
+        state = {}
+        ok = app.process_account({"cookie": "secret", "name": "test"}, state)
+
+        self.assertFalse(ok)
+        self.assertEqual(state["srv-stuck"]["status"], "failed")
+        client.stop_server.assert_called_once_with("srv-stuck")
+        notify.assert_called_once()
+        self.assertNotEqual(state["srv-stuck"]["status"], "success")
 
     @patch("app.time.sleep")
     @patch("app.send_notification")

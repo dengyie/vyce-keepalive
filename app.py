@@ -1072,6 +1072,24 @@ class VyceClient:
         )
         return interpret_renew_response(status, body)
 
+    def stop_server(self, server_id: str) -> Tuple[bool, int, str]:
+        """发起关机请求: POST /api/servers/{id}/stop，返回 (success, code, msg)。
+
+        用途：母机失联（hostIssue unreachable）时控制面可能把到期机器长期卡在
+        running 状态；running + expired 下调用 start 只回 200 "Server started"
+        而不触发免 CAPTCHA 的 Renew and start。此时主动请求关机，等待平台把
+        状态翻成 stopped 后再 start，即可走原生免验证码续期通道。
+        """
+        url = f"{API_BASE}/servers/{urllib.parse.quote(server_id, safe='')}/stop"
+        headers = dict(self.headers)
+        headers["Content-Type"] = "application/json"
+        headers["Origin"] = BASE_URL
+        headers["Referer"] = f"{BASE_URL}/"
+        status, _, body = http_request(
+            url, method="POST", headers=headers, data=b"{}", proxy=self.proxy, timeout=25
+        )
+        return interpret_start_response(status, body)
+
     def start_server(self, server_id: str) -> Tuple[bool, int, str]:
         """发起开机/复活请求: POST /api/servers/{id}/start，返回 (success, code, msg)。"""
         url = f"{API_BASE}/servers/{urllib.parse.quote(server_id, safe='')}/start"
@@ -1150,6 +1168,56 @@ def start_and_verify(
     else:
         start_msg = "start 响应未验证为续期成功"
     return False, start_code, start_msg, None
+
+
+def stop_wait_start(
+    client: VyceClient,
+    server_id: str,
+    previous_expires_at: float,
+    now_ms: int,
+) -> Tuple[bool, int, str, Optional[Dict]]:
+    """running + expired 死锁的主动关机兜底。
+
+    母机失联等平台故障会让到期机器长期卡在 running：/start 只回 200
+    "Server started" 而不刷新 expiresAt（平台仅对 stopped 触发 Renew and
+    start）。本流程主动调用 /stop 请求关机，轮询等待状态翻成 stopped 后再
+    调用 start，走原生免 CAPTCHA 续期通道。轮询有界，总时长与
+    START_VERIFY_DELAYS_SEC 同量级，避免长时间占用 runner。
+    """
+    stop_code, stop_msg = 0, ""
+    for delay in START_VERIFY_DELAYS_SEC:
+        if delay:
+            time.sleep(delay)
+
+        fresh_servers = client.get_servers()
+        if fresh_servers is None:
+            continue
+        current = next((s for s in fresh_servers if s.get("id") == server_id), None)
+        if not current:
+            continue
+
+        if current.get("status") == "stopped":
+            # 已翻成 stopped，立即 start 触发 Renew and start。
+            start_ok, start_code, start_msg, started = start_and_verify(
+                client, server_id, previous_expires_at
+            )
+            if start_ok:
+                return True, start_code, start_msg, started
+            start_msg = f"stop 后 start 未验证为续期成功: {safe_error_text(start_msg)}"
+            return False, start_code, start_msg, None
+
+        if current.get("expiresAt", 0) > now_ms:
+            # 已被平台自然续期（他人/平台侧动作），直接判定成功。
+            return True, 200, "Renewed (verified via server expiresAt)", current
+
+        if stop_code == 0:
+            # 尚未请求过关机：先发 /stop。母机失联时关机也可能失败/悬空，
+            # 不以单次 stop 响应论成败，继续轮询观察状态翻转。
+            stop_ok, stop_code, stop_msg = client.stop_server(server_id)
+            if not stop_ok:
+                return False, stop_code, f"stop 请求失败: {safe_error_text(stop_msg)}", None
+
+    return False, stop_code, f"等待 stopped 超时（stop 响应: {safe_error_text(stop_msg)}）", None
 
 
 # ============================================================
@@ -1368,6 +1436,21 @@ def process_account(account: Dict, state: Dict, proxy: Optional[str] = None) -> 
                             success = True
                             msg = "Renewed and started via start API fallback"
                             fresh_srv = st_srv
+                        elif check_srv.get("status") != "stopped":
+                            # start 未验证成功且机器仍卡在 running + expired
+                            # （典型为母机失联导致平台无法执行关机）：
+                            # 主动请求 /stop 促其翻 stopped，再走免验证码 Renew and start。
+                            print(f"   🔌 start 未生效且机器仍 running，尝试主动关机兜底 (stop -> wait stopped -> start)...")
+                            sp_ok, sp_code, sp_msg, sp_srv = stop_wait_start(
+                                client, srv_id, expires_at, now_ms
+                            )
+                            if sp_ok:
+                                print(f"   🎉 主动关机兜底成功，服务器已关停并经 start 续期！(到期: {ms_to_beijing_str(sp_srv['expiresAt'])})")
+                                success = True
+                                msg = "Renewed and started via stop->start deadlock recovery"
+                                fresh_srv = sp_srv
+                            else:
+                                print(f"   ⚠️ 主动关机兜底未验证成功 (HTTP {sp_code}: {safe_error_text(sp_msg)})")
 
         if success:
             print(f"   🎉 续期成功！({msg})")
